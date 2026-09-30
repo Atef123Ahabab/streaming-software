@@ -1,111 +1,135 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
+const validator = require('validator');
 const User = require('../models/User');
+const { authLimiter } = require('../middleware/rateLimit');
 const router = express.Router();
 
-// Register
-router.post('/register', async (req, res) => {
+// Admin email that bypasses rate limiting
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'ahababatef14@gmail.com').toLowerCase();
+
+const signToken = (userId) =>
+  jwt.sign({ userId }, process.env.JWT_SECRET, { expiresIn: '30d' });
+
+const sanitizeUser = (user) => ({
+  id: user._id,
+  username: user.username,
+  email: user.email,
+  isAdmin: !!user.isAdmin,
+  storageUsed: user.storageUsed,
+  storageLimit: user.storageLimit,
+});
+
+// Skip rate limit for admin email
+const conditionalAuthLimiter = (req, res, next) => {
+  const email = (req.body?.email || '').toLowerCase();
+  if (email === ADMIN_EMAIL) return next();
+  return authLimiter(req, res, next);
+};
+
+// POST /api/auth/register
+router.post('/register', conditionalAuthLimiter, async (req, res) => {
   try {
-    const { username, email, password } = req.body;
+    const { username, email, password } = req.body || {};
 
-    // Check if user exists
-    const existingUser = await User.findOne({
-      $or: [{ email }, { username }]
-    });
-
-    if (existingUser) {
-      return res.status(400).json({ 
-        message: 'User already exists with this email or username' 
-      });
+    if (!username || !email || !password) {
+      return res.status(400).json({ message: 'All fields are required' });
+    }
+    if (username.trim().length < 3) {
+      return res.status(400).json({ message: 'Username must be at least 3 characters' });
+    }
+    if (!validator.isEmail(email)) {
+      return res.status(400).json({ message: 'Please enter a valid email' });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ message: 'Password must be at least 8 characters' });
+    }
+    if (!/[a-zA-Z]/.test(password) || !/[0-9]/.test(password)) {
+      return res.status(400).json({ message: 'Password must contain at least one letter and one number' });
     }
 
-    // Create new user
-    const user = new User({ username, email, password });
+    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedUsername = username.trim();
+
+    const existing = await User.findOne({
+      $or: [{ email: normalizedEmail }, { username: normalizedUsername }],
+    });
+    if (existing) {
+      return res.status(409).json({ message: 'Account with that email or username already exists' });
+    }
+
+    const user = new User({
+      username: normalizedUsername,
+      email: normalizedEmail,
+      password,
+    });
     await user.save();
 
-    // Generate JWT token
-    const token = jwt.sign(
-      { userId: user._id }, 
-      process.env.JWT_SECRET, 
-      { expiresIn: '7d' }
-    );
+    const token = signToken(user._id);
 
-    res.status(201).json({
-      message: 'User created successfully',
+    return res.status(201).json({
+      message: 'Account created successfully',
       token,
-      user: {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        storageUsed: user.storageUsed,
-        storageLimit: user.storageLimit
-      }
+      user: sanitizeUser(user),
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('[register]', error.message);
+    return res.status(500).json({ message: 'Something went wrong. Please try again.' });
   }
 });
 
-// Login
-router.post('/login', async (req, res) => {
+// POST /api/auth/login
+router.post('/login', conditionalAuthLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password } = req.body || {};
 
-    // Find user
-    const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(400).json({ message: 'Invalid credentials' });
+    if (!email || !password) {
+      return res.status(400).json({ message: 'Email and password are required' });
+    }
+    if (!validator.isEmail(email)) {
+      return res.status(400).json({ message: 'Please enter a valid email' });
     }
 
-    // Check password
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid email or password' });
+    }
+
     const isMatch = await user.comparePassword(password);
     if (!isMatch) {
-      return res.status(400).json({ message: 'Invalid credentials' });
+      return res.status(401).json({ message: 'Invalid email or password' });
     }
 
-    // Generate token
-    const token = jwt.sign(
-      { userId: user._id }, 
-      process.env.JWT_SECRET, 
-      { expiresIn: '7d' }
-    );
+    const token = signToken(user._id);
 
-    res.json({
+    return res.json({
       message: 'Login successful',
       token,
-      user: {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        storageUsed: user.storageUsed,
-        storageLimit: user.storageLimit
-      }
+      user: sanitizeUser(user),
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('[login]', error.message);
+    return res.status(500).json({ message: 'Something went wrong. Please try again.' });
   }
 });
 
-// Get current user data
+// GET /api/auth/me
 router.get('/me', require('../middleware/auth'), async (req, res) => {
   try {
     const user = await User.findById(req.userId).select('-password');
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
-
-    res.json({
-      user: {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        storageUsed: user.storageUsed,
-        storageLimit: user.storageLimit
-      }
-    });
+    return res.json({ user: sanitizeUser(user) });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('[me]', error.message);
+    return res.status(500).json({ message: 'Something went wrong.' });
   }
+});
+
+// POST /api/auth/logout
+router.post('/logout', (req, res) => {
+  return res.json({ message: 'Logged out' });
 });
 
 module.exports = router;
